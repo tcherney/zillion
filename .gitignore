@@ -4,3 +4,4 @@
 /patches/healed/
 /output/
 /.zig-cache/
+*.txt
