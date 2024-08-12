@@ -15,7 +15,7 @@ const Calculation = struct { sum: f32 = undefined, min: f32 = undefined, max: f3
 
 pub fn parse_and_collect_measurement(buffer: []u8, calculations: *std.StringHashMap(Calculation), lock: *std.Thread.Mutex, allocator: std.mem.Allocator) !void {
     var local_calculations: std.StringHashMap(Calculation) = std.StringHashMap(Calculation).init(allocator);
-    try local_calculations.ensureTotalCapacity(512 * 2 * 2);
+    try local_calculations.ensureTotalCapacity(2048);
     defer local_calculations.deinit();
     var start: usize = 0;
     while (start < buffer.len) {
@@ -61,6 +61,9 @@ pub fn thread_run(buffer: []u8, calculations: *std.StringHashMap(Calculation), l
 
 const BufferType = if (builtin.os.tag == .windows) []u8 else []align(std.mem.page_size) u8;
 
+pub extern "kernel32" fn CreateFileMappingA(hFile: std.os.windows.HANDLE, lpFileMappingAttributes: std.os.windows.DWORD, flProtect: std.os.windows.DWORD, dwMaximumSizeHigh: std.os.windows.DWORD, dwMaximumSizeLow: std.os.windows.DWORD, lpName: std.os.windows.DWORD) callconv(std.os.windows.WINAPI) ?std.os.windows.HANDLE;
+pub extern "kernel32" fn MapViewOfFile(hFileMappingObject: std.os.windows.HANDLE, dwDesiredAccess: std.os.windows.DWORD, dwFileOffsetHigh: std.os.windows.DWORD, dwFileOffsetLow: std.os.windows.DWORD, dwNumberOfBytesToMap: std.os.windows.SIZE_T) callconv(std.os.windows.WINAPI) ?std.os.windows.LPVOID;
+
 pub fn main() !void {
     const stdout_file = std.io.getStdOut().writer();
     var bw = std.io.bufferedWriter(stdout_file);
@@ -72,7 +75,10 @@ pub fn main() !void {
     const size_limit = try file.getEndPos();
     var buffer: BufferType = undefined;
     if (builtin.os.tag == .windows) {
-        buffer = try file.readToEndAlloc(allocator, size_limit);
+        const hMap = CreateFileMappingA(file.handle, 0, std.os.windows.PAGE_READONLY, 0, 0, 0);
+        const lpBasePtr = MapViewOfFile(hMap.?, 4, 0, 0, 0);
+        buffer = @as([*]u8, @ptrCast(lpBasePtr.?))[0..size_limit];
+        //buffer = try file.readToEndAlloc(allocator, size_limit);
     } else {
         buffer = try std.posix.mmap(
             null,
@@ -84,12 +90,11 @@ pub fn main() !void {
         );
         try std.posix.madvise(buffer.ptr, size_limit, std.posix.MADV.HUGEPAGE);
     }
-
     try timer_end(" For input");
     var lock = std.Thread.Mutex{};
     const NUM_THREADS = try std.Thread.getCpuCount() - 1;
     var calculations: std.StringHashMap(Calculation) = std.StringHashMap(Calculation).init(allocator);
-    try calculations.ensureTotalCapacity(512 * 2 * 2);
+    try calculations.ensureTotalCapacity(2048);
     var threads: []std.Thread = try allocator.alloc(std.Thread, NUM_THREADS);
     const data_split = buffer.len / NUM_THREADS;
     var start: usize = 0;
