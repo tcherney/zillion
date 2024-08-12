@@ -23,15 +23,16 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const ztracy = b.dependency("ztracy", .{
-        .enable_ztracy = true,
-        .enable_fibers = true,
-    });
-    exe.root_module.addImport("ztracy", ztracy.module("root"));
-    exe.linkLibrary(ztracy.artifact("tracy"));
+    // const ztracy = b.dependency("ztracy", .{
+    //     .enable_ztracy = true,
+    //     .enable_fibers = true,
+    // });
+    // exe.root_module.addImport("ztracy", ztracy.module("root"));
+    // exe.linkLibrary(ztracy.artifact("tracy"));
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default
     // step when running `zig build`).
+    exe.linkLibC();
     b.installArtifact(exe);
 
     // This *creates* a Run step in the build graph, to be executed when another

@@ -1,5 +1,5 @@
 const std = @import("std");
-const ztracy = @import("ztracy");
+const builtin = @import("builtin");
 
 var timer: std.time.Timer = undefined;
 pub fn timer_start() !void {
@@ -13,7 +13,10 @@ pub fn timer_end(msg: []const u8) !void {
 
 const Calculation = struct { sum: f32 = undefined, min: f32 = undefined, max: f32 = undefined, num: u32 = undefined };
 
-pub fn parse_and_collect_measurement(buffer: []u8, calculations: *std.StringHashMap(Calculation), lock: *std.Thread.Mutex) !void {
+pub fn parse_and_collect_measurement(buffer: []u8, calculations: *std.StringHashMap(Calculation), lock: *std.Thread.Mutex, allocator: std.mem.Allocator) !void {
+    var local_calculations: std.StringHashMap(Calculation) = std.StringHashMap(Calculation).init(allocator);
+    try local_calculations.ensureTotalCapacity(512 * 2 * 2);
+    defer local_calculations.deinit();
     var start: usize = 0;
     while (start < buffer.len) {
         const end: usize = std.mem.indexOfScalarPos(u8, buffer, start, '\n') orelse buffer.len;
@@ -21,28 +24,44 @@ pub fn parse_and_collect_measurement(buffer: []u8, calculations: *std.StringHash
         const line_split = std.mem.indexOfScalar(u8, line, ';') orelse continue;
         const station_name = line[0..line_split];
         const value = try std.fmt.parseFloat(f32, line[line_split + 1 .. line.len - 1]);
-        lock.lock();
-        const station = try calculations.getOrPut(station_name);
+
+        const station = try local_calculations.getOrPut(station_name);
         if (station.found_existing) {
-            station.value_ptr.*.max = if (value > station.value_ptr.*.max) value else station.value_ptr.*.max;
-            station.value_ptr.*.min = if (value < station.value_ptr.*.min) value else station.value_ptr.*.min;
+            station.value_ptr.*.max = @max(value, station.value_ptr.*.max);
+            station.value_ptr.*.min = @min(value, station.value_ptr.*.min);
             station.value_ptr.*.sum += value;
             station.value_ptr.*.num += 1;
         } else {
             station.value_ptr.* = Calculation{ .min = value, .max = value, .sum = 0.0, .num = 1 };
         }
-        lock.unlock();
+
         start = end + 1;
     }
+    var key_iter = local_calculations.iterator();
+    lock.lock();
+    while (key_iter.next()) |local_calc| {
+        const station_name = local_calc.key_ptr.*;
+        const station = local_calc.value_ptr.*;
+        const calc = try calculations.getOrPut(station_name);
+        if (calc.found_existing) {
+            calc.value_ptr.*.max = @max(calc.value_ptr.*.max, station.max);
+            calc.value_ptr.*.min = @min(calc.value_ptr.*.min, station.min);
+            calc.value_ptr.*.sum += station.sum;
+            calc.value_ptr.*.num += station.num;
+        } else {
+            calc.value_ptr.* = station;
+        }
+    }
+    lock.unlock();
 }
 
-pub fn thread_run(buffer: []u8, calculations: *std.StringHashMap(Calculation), lock: *std.Thread.Mutex) !void {
-    try parse_and_collect_measurement(buffer, calculations, lock);
+pub fn thread_run(buffer: []u8, calculations: *std.StringHashMap(Calculation), lock: *std.Thread.Mutex, allocator: std.mem.Allocator) !void {
+    try parse_and_collect_measurement(buffer, calculations, lock, allocator);
 }
+
+const BufferType = if (builtin.os.tag == .windows) []u8 else []align(std.mem.page_size) u8;
 
 pub fn main() !void {
-    const tracy_zone = ztracy.ZoneNC(@src(), "Compute Magic", 0x00_ff_00_00);
-    defer tracy_zone.End();
     const stdout_file = std.io.getStdOut().writer();
     var bw = std.io.bufferedWriter(stdout_file);
     const stdout = bw.writer();
@@ -50,20 +69,34 @@ pub fn main() !void {
     const allocator = gpa.allocator();
     try timer_start();
     const file = try std.fs.cwd().openFile("measurements.txt", .{});
-    const size_limit = std.math.maxInt(usize);
-    const buffer = try file.readToEndAlloc(allocator, size_limit);
+    const size_limit = try file.getEndPos();
+    var buffer: BufferType = undefined;
+    if (builtin.os.tag == .windows) {
+        buffer = try file.readToEndAlloc(allocator, size_limit);
+    } else {
+        buffer = try std.posix.mmap(
+            null,
+            size_limit,
+            std.posix.PROT.READ,
+            .{ .TYPE = .PRIVATE },
+            file.handle,
+            0,
+        );
+        try std.posix.madvise(buffer.ptr, size_limit, std.posix.MADV.HUGEPAGE);
+    }
 
     try timer_end(" For input");
     var lock = std.Thread.Mutex{};
-    const NUM_THREADS = 8;
+    const NUM_THREADS = try std.Thread.getCpuCount() - 1;
     var calculations: std.StringHashMap(Calculation) = std.StringHashMap(Calculation).init(allocator);
+    try calculations.ensureTotalCapacity(512 * 2 * 2);
     var threads: []std.Thread = try allocator.alloc(std.Thread, NUM_THREADS);
     const data_split = buffer.len / NUM_THREADS;
     var start: usize = 0;
     for (0..NUM_THREADS) |i| {
         const start_end: usize = (i + 1) * data_split;
         const end: usize = std.mem.indexOfScalarPos(u8, buffer, start_end, '\n') orelse buffer.len;
-        threads[i] = try std.Thread.spawn(.{}, thread_run, .{ buffer[start..end], &calculations, &lock });
+        threads[i] = try std.Thread.spawn(.{}, thread_run, .{ buffer[start..end], &calculations, &lock, allocator });
         start = end + 1;
         if (start >= buffer.len) break;
     }
@@ -85,7 +118,11 @@ pub fn main() !void {
     try timer_end(" For output");
     file.close();
     calculations.deinit();
-    allocator.free(buffer);
+    if (builtin.os.tag == .windows) {
+        allocator.free(buffer);
+    } else {
+        std.posix.munmap(buffer);
+    }
     if (gpa.deinit() == .leak) {
         std.debug.print("Leaked!\n", .{});
     }
